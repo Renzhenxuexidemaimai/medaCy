@@ -5,8 +5,10 @@ import string
 
 import torch
 import torch.nn as nn
+import pytorch_lightning as pl
 
-class CharacterLSTM(nn.Module):
+
+class CharacterLSTM(pl.LightningModule):
     """
     BiLSTM and CRF pytorch layers.
 

@@ -5,6 +5,8 @@ import string
 
 import torch
 import torch.nn as nn
+import pytorch_lightning as pl
+
 from torchcrf import CRF
 
 from medacy.nn import CharacterLSTM
@@ -13,7 +15,7 @@ HIDDEN_DIM = 200
 CHARACTER_HIDDEN_DIM = 100
 CHARACTER_EMBEDDING_SIZE = 100
 
-class BiLstmCrf(nn.Module):
+class BiLstmCrf(pl.LightningModule):
     """
     BiLSTM and CRF pytorch layers.
 
@@ -58,7 +60,7 @@ class BiLstmCrf(nn.Module):
 
         # Setup dropout layer to randomly zero elements from lstm output before
         # being input into Linear Layer
-        self.dropout = nn.Dropout(p=0.5)
+        #self.dropout = nn.Dropout(p=0.5)
 
         # The linear layer that maps from hidden state space to tag space
         linear_input_size = HIDDEN_DIM*2 + other_features
@@ -116,9 +118,11 @@ class BiLstmCrf(nn.Module):
         lstm_out = lstm_out.view(len(sentence), HIDDEN_DIM*2)
         lstm_out = torch.cat((lstm_out, other_features), 1)
 
-        dropout = self.dropout(lstm_out)
+        #dropout = self.dropout(lstm_out)
 
-        lstm_features = self.hidden2tag(dropout)
+        #lstm_features = self.hidden2tag(dropout)
+
+        lstm_features = self.hidden2tag(lstm_out)
 
         return lstm_features
 
