@@ -17,10 +17,19 @@ from medacy.pipelines.base.base_pipeline import BasePipeline
 
 class Model:
     """
-    A medaCy named entity recognition model wraps together three functionalities
+    A medaCy Model allows the fitting of a named entity recognition model to a given dataset according to the
+    configuration of a given medaCy pipeline. Once fitted, Model instances can be used to predict over documents.
+    Also included is a function for cross validating over a dataset for measuring the performance of a pipeline.
+
+    :ivar pipeline: a medaCy pipeline, must be a subclass of BasePipeline (see medacy.pipelines.base.BasePipeline)
+    :ivar model: weights, if the model has been fitted
+    :ivar n_jobs: the number of CPU cores to be used by processes of this instance, defaults to the number of CPUs on
+    the machine it's running on
+    :ivar X_data: X_data from the pipeline; primarily for internal use
+    :ivar y_data: y_data from the pipeline; primarily for internal use
     """
 
-    def __init__(self, medacy_pipeline=None, model=None, n_jobs=cpu_count()):
+    def __init__(self, medacy_pipeline, model=None, n_jobs=cpu_count()):
 
         if not isinstance(medacy_pipeline, BasePipeline):
             raise TypeError("Pipeline must be a medaCy pipeline that interfaces medacy.pipelines.base.BasePipeline")
@@ -114,41 +123,48 @@ class Model:
         if not isinstance(dataset, (Dataset, str)):
             raise TypeError("Must pass in an instance of Dataset containing your examples to be used for prediction")
         if self.model is None:
-            raise ValueError("Must fit or load a pickled model before predicting")
-
-        model = self.model
-        medacy_pipeline = self.pipeline
+            raise RuntimeError("Must fit or load a pickled model before predicting")
 
         if isinstance(dataset, Dataset):
             # create directory to write predictions to
-            prediction_directory = self.create_annotation_directory(directory=prediction_directory, training_dataset=dataset, option="predictions")
+            prediction_directory = self.create_annotation_directory(
+                directory=prediction_directory,
+                training_dataset=dataset,
+                option="predictions"
+            )
 
             # create directory to write groundtruth to
-            groundtruth_directory = self.create_annotation_directory(directory=groundtruth_directory, training_dataset=dataset, option="groundtruth")
+            groundtruth_directory = self.create_annotation_directory(
+                directory=groundtruth_directory,
+                training_dataset=dataset,
+                option="groundtruth"
+            )
 
             for data_file in dataset:
                 logging.info("Predicting file: %s", data_file.file_name)
+
                 with open(data_file.txt_path, 'r') as raw_text:
-                    doc = medacy_pipeline.spacy_pipeline.make_doc(raw_text.read())
-                    doc.set_extension('file_name', default=data_file.file_name, force=True)
-                    if data_file.metamapped_path is not None:
-                        doc.set_extension('metamapped_file', default=data_file.metamapped_path, force=True)
+                    doc = self.pipeline.spacy_pipeline.make_doc(raw_text.read())
+
+                doc.set_extension('file_name', default=data_file.file_name, force=True)
+                if data_file.metamapped_path is not None:
+                    doc.set_extension('metamapped_file', default=data_file.metamapped_path, force=True)
 
                 # run through the pipeline
-                doc = medacy_pipeline(doc, predict=True)
+                doc = self.pipeline(doc, predict=True)
 
-                annotations = predict_document(model, doc, medacy_pipeline)
+                annotations = predict_document(self.model, doc, self.pipeline)
                 logging.debug("Writing to: %s", os.path.join(prediction_directory, data_file.file_name + ".ann"))
                 annotations.to_ann(write_location=os.path.join(prediction_directory, data_file.file_name + ".ann"))
 
         if isinstance(dataset, str):
-            assert 'metamap_annotator' not in self.pipeline.get_components(), \
-                "Cannot currently predict on the fly when metamap_component is in pipeline."
+            if 'metamap_annotator' in self.pipeline.get_components():
+                raise RuntimeError("Cannot currently predict on the fly when metamap_component is in pipeline.")
 
-            doc = medacy_pipeline.spacy_pipeline.make_doc(dataset)
+            doc = self.pipeline.spacy_pipeline.make_doc(dataset)
             doc.set_extension('file_name', default="STRING_INPUT", force=True)
-            doc = medacy_pipeline(doc, predict=True)
-            annotations = predict_document(model, doc, medacy_pipeline)
+            doc = self.pipeline(doc, predict=True)
+            annotations = predict_document(self.model, doc, self.pipeline)
             return annotations
 
     def cross_validate(self, training_dataset=None, num_folds=5, prediction_directory=None, groundtruth_directory=None, asynchronous=False):
@@ -186,30 +202,22 @@ class Model:
         X_data = self.X_data
         Y_data = self.y_data
 
-        medacy_pipeline = self.pipeline
-
         cv = SequenceStratifiedKFold(folds=num_folds)
 
-        tagset = set()
-        for tags in Y_data:
-            for tag in tags:
-                if tag != 'O' and tag != '':
-                    tagset.add(tag)
-        tagset = list(tagset)
-        tagset.sort()
-        medacy_pipeline.entities = tagset
-        logging.info('Tagset: %s', tagset)
+        tags = sorted(training_dataset.get_labels(as_list=True))
+        self.pipeline.entities = tags
+        logging.info('Tagset: %s', tags)
 
         eval_stats = {}
         fold = 1
 
         # Dict for storing mapping of sequences to their corresponding file
-        groundtruth_by_document = {filename: [] for filename in list(set([x[2] for x in X_data]))}
-        preds_by_document = {filename: [] for filename in list(set([x[2] for x in X_data]))}
+        groundtruth_by_document = {filename: [] for filename in {x[2] for x in X_data}}
+        preds_by_document = {filename: [] for filename in {x[2] for x in X_data}}
 
         for train_indices, test_indices in cv(X_data, Y_data):
             fold_statistics = {}
-            learner_name, learner = medacy_pipeline.get_learner()
+            learner_name, learner = self.pipeline.get_learner()
 
             X_train = [X_data[index] for index in train_indices]
             y_train = [Y_data[index] for index in train_indices]
@@ -259,8 +267,8 @@ class Model:
                 span_indices = []
 
                 for sequence in X_test:
-                    document_indices += [sequence[2] for x in range(len(sequence[0]))]
-                    span_indices += [element for element in sequence[1]]
+                    document_indices += [sequence[2]] * len(sequence[0])
+                    span_indices += list(sequence[1])
 
                 predictions = [element for sentence in y_pred for element in sentence]
 
@@ -285,7 +293,7 @@ class Model:
                     i += 1
 
             # Write the metrics for this fold.
-            for label in tagset:
+            for label in tags:
                 fold_statistics[label] = {
                     "recall": metrics.flat_recall_score(y_test, y_pred, average='weighted', labels=[label]),
                     "precision": metrics.flat_precision_score(y_test, y_pred, average='weighted', labels=[label]),
@@ -294,17 +302,17 @@ class Model:
 
             # add averages
             fold_statistics['system'] = {
-                "recall": metrics.flat_recall_score(y_test, y_pred, average='weighted', labels=tagset),
-                "precision": metrics.flat_precision_score(y_test, y_pred, average='weighted', labels=tagset),
-                "f1": metrics.flat_f1_score(y_test, y_pred, average='weighted', labels=tagset)
+                "recall": metrics.flat_recall_score(y_test, y_pred, average='weighted', labels=tags),
+                "precision": metrics.flat_precision_score(y_test, y_pred, average='weighted', labels=tags),
+                "f1": metrics.flat_f1_score(y_test, y_pred, average='weighted', labels=tags)
             }
 
             table_data = [
                 [label,
-                format(fold_statistics[label]['precision'], ".3f"),
-                format(fold_statistics[label]['recall'], ".3f"),
-                format(fold_statistics[label]['f1'], ".3f")
-                ] for label in tagset + ['system']
+                 format(fold_statistics[label]['precision'], ".3f"),
+                 format(fold_statistics[label]['recall'], ".3f"),
+                 format(fold_statistics[label]['f1'], ".3f")
+                 ] for label in tags + ['system']
             ]
 
             logging.info('\n' + tabulate(table_data, headers=['Entity', 'Precision', 'Recall', 'F1'], tablefmt='orgtbl'))
@@ -314,7 +322,7 @@ class Model:
 
         statistics_all_folds = {}
 
-        for label in tagset + ['system']:
+        for label in tags + ['system']:
             statistics_all_folds[label] = {
                 'precision_average': mean(eval_stats[fold][label]['precision'] for fold in eval_stats),
                 'precision_max': max(eval_stats[fold][label]['precision'] for fold in eval_stats),
@@ -326,35 +334,48 @@ class Model:
                 'f1_min': min(eval_stats[fold][label]['f1'] for fold in eval_stats),
             }
 
+        entity_counts = training_dataset.compute_counts()
+
         table_data = [
-            [label,
-            format(statistics_all_folds[label]['precision_average'], ".3f"),
-            format(statistics_all_folds[label]['recall_average'], ".3f"),
-            format(statistics_all_folds[label]['f1_average'], ".3f"),
-            format(statistics_all_folds[label]['f1_min'], ".3f"),
-            format(statistics_all_folds[label]['f1_max'], ".3f")
-            ] for label in tagset + ['system']
+            [f"{label} ({entity_counts[label]})",  # Entity (Count)
+             format(statistics_all_folds[label]['precision_average'], ".3f"),
+             format(statistics_all_folds[label]['recall_average'], ".3f"),
+             format(statistics_all_folds[label]['f1_average'], ".3f"),
+             format(statistics_all_folds[label]['f1_min'], ".3f"),
+             format(statistics_all_folds[label]['f1_max'], ".3f")
+             ] for label in tags + ['system']
         ]
 
-        logging.info("\n"+tabulate(table_data, headers=['Entity', 'Precision', 'Recall', 'F1', 'F1_Min', 'F1_Max'],
-                       tablefmt='orgtbl'))
+        logging.info("\n" + tabulate(
+            table_data,
+            headers=['Entity (Count)', 'Precision', 'Recall', 'F1', 'F1_Min', 'F1_Max'],
+            tablefmt='orgtbl'
+            )
+        )
 
         if prediction_directory:
             
-            prediction_directory = training_dataset.get_data_directory() + "/predictions"
-            groundtruth_directory = training_dataset.get_data_directory() + "/groundtruth"
+            prediction_directory = os.path.join(training_dataset.data_directory, "predictions")
+            groundtruth_directory = os.path.join(training_dataset.data_directory, "groundtruth")
             
             # Write annotations generated from cross-validation
-            self.create_annotation_directory(directory=prediction_directory,training_dataset=training_dataset, option="predictions")
+            self.create_annotation_directory(
+                directory=prediction_directory,
+                training_dataset=training_dataset,
+                option="predictions"
+            )
 
             # Write medaCy ground truth generated from cross-validation
-            self.create_annotation_directory(directory=groundtruth_directory,training_dataset=training_dataset,option="groundtruth")
+            self.create_annotation_directory(
+                directory=groundtruth_directory,
+                training_dataset=training_dataset,
+                option="groundtruth"
+            )
             
             # Add predicted/known annotations to the folders containing groundtruth and predictions respectively
             self.predict_annotation_evaluation(
                 directory=groundtruth_directory,
                 training_dataset=training_dataset,
-                medacy_pipeline=medacy_pipeline,
                 preds_by_document=preds_by_document,
                 groundtruth_by_document=groundtruth_by_document,
                 option="groundtruth"
@@ -363,13 +384,12 @@ class Model:
             self.predict_annotation_evaluation(
                 directory=prediction_directory,
                 training_dataset=training_dataset,
-                medacy_pipeline= medacy_pipeline,
                 preds_by_document=preds_by_document,
                 groundtruth_by_document=groundtruth_by_document,
                 option="predictions"
             )
 
-            return Dataset(data_directory=prediction_directory)
+            return Dataset(prediction_directory)
         else:
             return statistics_all_folds
 
@@ -384,11 +404,11 @@ class Model:
             os.makedirs(directory)
         return directory
 
-    def predict_annotation_evaluation(self, directory, training_dataset, medacy_pipeline, preds_by_document, groundtruth_by_document, option):
-        for data_file in training_dataset.get_data_files():
+    def predict_annotation_evaluation(self, directory, training_dataset, preds_by_document, groundtruth_by_document, option):
+        for data_file in training_dataset:
             logging.info("Predicting %s file: %s", option, data_file.file_name)
-            with open(data_file.raw_path, 'r') as raw_text:
-                doc = medacy_pipeline.spacy_pipeline.make_doc(raw_text.read())
+            with open(data_file.txt_path, 'r') as f:
+                doc = self.pipeline.spacy_pipeline.make_doc(f.read())
                 
             if option == "groundtruth":
                 preds = groundtruth_by_document[data_file.file_name]
@@ -398,7 +418,7 @@ class Model:
             annotations = construct_annotations_from_tuples(doc, preds)
             annotations.to_ann(write_location=os.path.join(directory, data_file.file_name + ".ann"))
         
-        return annotations
+        return Dataset(directory)
 
     def _extract_features(self, data_file, is_metamapped):
         """
