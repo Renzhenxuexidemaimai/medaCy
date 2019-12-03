@@ -76,6 +76,8 @@ class Entity:
             ann = Annotations(doc.ann_path, doc.txt_path)
         elif isinstance(doc, str):
             ann = Annotations(doc)
+        elif isinstance(doc, Annotations):
+            ann = doc
         else:
             raise ValueError(f"'doc'' must be DataFile or str, but is '{type(doc)}'")
 
